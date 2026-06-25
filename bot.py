@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+bot.py - Main loop, scheduler, position slot manager
+Autonomous crypto trading bot for Bybit USDT perpetuals.
+"""
+import sys
+import os
+import time
+import signal
+import threading
+
+# Ensure local imports work
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config
+import exchange
+import strategy
+import news
+import smc
+import advanced
+from logger import log, log_error, close as close_logger
+from trader import LiveTrader
+from demo import DemoTrader
+
+# ─── GLOBALS ──────────────────────────────────────────────────
+_shutdown = threading.Event()
+_trader = None
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully."""
+    _shutdown.set()
+
+
+# ─── STARTUP VALIDATION ──────────────────────────────────────
+
+def validate_startup():
+    """Run all pre-flight checks. Returns (success, usd_php_rate)."""
+    log("BOOT", "Running startup validation...")
+
+    # 1. Check USD/PHP rate
+    usd_php = exchange.get_usd_php_rate()
+    if usd_php <= 0:
+        log("BOOT", "ERROR: Cannot fetch USD/PHP rate")
+        return False, 0
+
+    log("BOOT", f"USD/PHP rate: ₱{usd_php:.2f}")
+
+    # 2. Check Bybit connectivity - fetch pairs
+    pairs = exchange.get_usdt_perpetual_pairs()
+    if not pairs:
+        log("BOOT", "ERROR: Cannot fetch trading pairs from Bybit")
+        log("BOOT", "Check errors.log for details. Common causes:")
+        log("BOOT", "  - Network/DNS issue (try: curl https://api.bybit.com/v5/market/instruments-info?category=linear)")
+        log("BOOT", "  - Bybit blocked in your region (try VPN)")
+        log("BOOT", "  - SSL certificate issue (update ca-certificates)")
+        return False, 0
+
+    log("BOOT", f"Available pairs: {len(pairs)}")
+
+    # 3. For LIVE mode, validate API keys
+    if config.TRADE_MODE == "LIVE":
+        if not config.BYBIT_API_KEY or not config.BYBIT_API_SECRET:
+            log("BOOT", "ERROR: API keys not configured for LIVE mode")
+            return False, 0
+
+        # Check balance
+        balance = exchange.get_wallet_balance()
+        if balance <= 0:
+            log("BOOT", "WARNING: Wallet balance is 0 USDT")
+
+        balance_php = balance * usd_php
+        log("BOOT", f"Wallet: {balance:.2f} USDT (₱{balance_php:,.0f})")
+
+        # Check permissions
+        if not exchange.check_api_permissions():
+            log("BOOT", "WARNING: API may lack trading permissions")
+
+    return True, usd_php
+
+
+# ─── SCAN LOOP ────────────────────────────────────────────────
+
+def scan_pairs(pairs, trader, usd_php):
+    """Scan all pairs for trading signals, prioritized by news sentiment."""
+    if trader.open_slots() <= 0:
+        return
+
+    # Refresh news and prioritize pairs by sentiment
+    news.refresh_if_needed()
+    ordered_pairs = news.get_prioritized_pairs(pairs)
+
+    for symbol in ordered_pairs:
+        if _shutdown.is_set():
+            break
+
+        # If we already have a position, check for reversal signal
+        if trader.has_position(symbol):
+            try:
+                # Quick check with just 2 timeframes for reversal detection
+                candles_5m = exchange.get_klines(symbol, "5", 100)
+                candles_1h = exchange.get_klines(symbol, "60", 200)
+                if len(candles_5m) >= 80 and len(candles_1h) >= 100:
+                    funding = exchange.get_funding_rate(symbol)
+                    bids, asks = exchange.get_orderbook(symbol, 25)
+                    ob_ratio = bids / asks if asks > 0 else 1.0
+                    sig = strategy.get_signal(candles_1h, candles_5m, funding, ob_ratio)
+                    if sig["direction"] and sig["score"] >= config.SIGNAL_MIN_SCORE:
+                        pos = trader.get_position(symbol)
+                        if pos and not pos.reversal_detected:
+                            if (pos.side == "LONG" and sig["direction"] == "SHORT") or \
+                               (pos.side == "SHORT" and sig["direction"] == "LONG"):
+                                trader.mark_reversal(symbol, sig["direction"])
+            except Exception as e:
+                log_error("REV_CHECK", f"{symbol}: {e}")
+            continue
+
+        if trader.open_slots() <= 0:
+            break
+
+        # Skip pairs with extreme negative news
+        if news.should_avoid_pair(symbol):
+            log("SKIP", f"{symbol} | Heavy bearish news — avoiding")
+            continue
+
+        try:
+            # Fetch candle data for ALL configured timeframes
+            candles_by_tf = {}
+            for tf in config.CHART_TIMEFRAMES:
+                candles = exchange.get_klines(symbol, tf, 200)
+                if candles and len(candles) >= 50:
+                    candles_by_tf[tf] = candles
+                # Small rate limit between TF fetches
+                if len(config.CHART_TIMEFRAMES) > 3:
+                    import time as _t
+                    _t.sleep(0.1)
+
+            # Need at least 2 TFs to work with
+            if len(candles_by_tf) < 2:
+                continue
+
+            # Use 1H and 5M as fallback for legacy compatibility
+            candles_1h = candles_by_tf.get("60", candles_by_tf.get("240", []))
+            candles_5m = candles_by_tf.get("5", candles_by_tf.get("15", []))
+
+            if len(candles_1h) < 100 or len(candles_5m) < 50:
+                continue
+
+            # Get funding rate
+            funding = exchange.get_funding_rate(symbol)
+
+            # Get orderbook imbalance
+            bids, asks = exchange.get_orderbook(symbol, 25)
+            ob_ratio = bids / asks if asks > 0 else 1.0
+
+            # Get signal with multi-TF data
+            sig = strategy.get_signal(candles_1h, candles_5m, funding, ob_ratio,
+                                     candles_by_tf=candles_by_tf)
+
+            direction = sig["direction"]
+            score = sig["score"]
+            bias_1h = sig["bias_1h"]
+            trend_tf = sig.get("trend_tf", "1H")
+            entry_tf = sig.get("entry_tf", "5M")
+
+            # Log skip reasons
+            if sig["skip_reason"]:
+                if direction and score > 0:
+                    log("SKIP", f"{symbol} | Score:{score}% | {sig['skip_reason']}")
+                continue
+
+            if direction is None:
+                continue
+
+            # Check conflict
+            if (direction == "LONG" and bias_1h == "BEAR") or \
+               (direction == "SHORT" and bias_1h == "BULL"):
+                log("SKIP", f"{symbol} | {trend_tf}:{bias_1h} {entry_tf}:{direction} | Conflict")
+                continue
+
+            # ── SMART MONEY CONCEPTS ──
+            smc_result = smc.analyze_smc(candles_5m)
+            if smc_result["direction"] == direction:
+                score += smc_result["score"]
+            elif smc_result["direction"] and smc_result["direction"] != direction:
+                score -= 10  # SMC disagrees
+
+            # ── ADVANCED LAYERS (session, divergence, volatility, BTC, volume) ──
+            btc_candles = None
+            if symbol != "BTCUSDT":
+                btc_candles = exchange.get_klines("BTCUSDT", config.PRIMARY_TF, 60)
+            adv = advanced.get_advanced_score(candles_5m, candles_1h, direction, btc_candles)
+            score += adv["score_adjustment"]
+
+            # ── NEWS SENTIMENT BONUS/PENALTY ──
+            news_bonus = news.get_news_score_bonus(symbol, direction)
+            score += news_bonus
+            news_info = news.get_sentiment(symbol)
+            news_tag = ""
+            if news_info:
+                news_tag = f" News:{news_info['bias']}({news_bonus:+d})"
+
+            # Log the scan result
+            side_5m = direction
+            smc_tag = ""
+            if smc_result["score"] > 0:
+                smc_tag = f" SMC:+{smc_result['score']}"
+            adv_tag = ""
+            if adv["score_adjustment"] != 0:
+                adv_tag = f" Adv:{adv['score_adjustment']:+d}"
+
+            log("SCAN", f"{symbol} {trend_tf}:{bias_1h} {entry_tf}:{side_5m} | "
+                f"Score:{score}%{smc_tag}{adv_tag}{news_tag}")
+
+            # Log strategies
+            strats = sig["strategies"]
+            strat_str = " ".join(
+                f"{k}:{'✓' if v else '✗'}" for k, v in strats.items()
+            )
+            if smc_result["direction"]:
+                strat_str += f" SMC:{smc_result['direction']}"
+            if strat_str:
+                log("STRATEGIES", strat_str)
+
+            # Log advanced reasons if any
+            if adv["reasons"]:
+                log("ADVANCED", " | ".join(adv["reasons"]))
+
+            # Check minimum score
+            if score < config.SIGNAL_MIN_SCORE:
+                log("SKIP", f"{symbol} | Score:{score}% | Below threshold")
+                continue
+
+            # Get dynamic TP from strategy
+            tp_roi = sig.get("tp_roi", config.TAKE_PROFIT_ROI_PCT)
+            log("TP TARGET", f"{symbol} | Dynamic TP: +{tp_roi}% ROI")
+
+            # Execute trade
+            if config.TRADE_MODE == "DEMO":
+                trader.open_position(symbol, direction, tp_roi=tp_roi)
+            else:
+                balance = exchange.get_wallet_balance()
+                trader.open_position(symbol, direction, balance, tp_roi=tp_roi)
+
+            # Rate limit between successful trades
+            time.sleep(1)
+
+        except Exception as e:
+            log_error("SCAN", f"{symbol}: {e}")
+            continue
+
+        # Rate limit between pair scans
+        time.sleep(0.3)
+
+
+# ─── MAIN ─────────────────────────────────────────────────────
+
+def main():
+    global _trader
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Validate
+    success, usd_php = validate_startup()
+    if not success:
+        log("BOOT", "Startup validation failed. Exiting.")
+        sys.exit(1)
+
+    # Get pairs
+    pairs = exchange.get_usdt_perpetual_pairs()
+
+    # Initialize news sentiment (first fetch)
+    log("BOOT", "Fetching crypto news sentiment...")
+    news.update_news_sentiment()
+
+    # Initialize trader
+    if config.TRADE_MODE == "DEMO":
+        _trader = DemoTrader(usd_php)
+        balance_php = _trader.balance_php  # use recovered balance if available
+    else:
+        _trader = LiveTrader(usd_php)
+        _trader.recover_positions()  # load open positions from Bybit
+        balance_usdt = exchange.get_wallet_balance()
+        balance_php = balance_usdt * usd_php
+
+    log("BOOT", f"Mode: {config.TRADE_MODE} | Balance: ₱{balance_php:,.0f} | "
+        f"Pairs: {len(pairs)}")
+    log("BOOT", f"Leverage: {config.LEVERAGE}x | SL: {config.STOP_LOSS_ROI_PCT}% | "
+        f"TP: +{config.TAKE_PROFIT_ROI_PCT}% | Trail: {config.TRAILING_STOP_ACTIVATE_ROI}%/"
+        f"{config.TRAILING_STOP_TRAIL_ROI}%")
+
+    # Start trailing stop monitor
+    _trader.start_trailing_monitor()
+
+    # Log recovered positions immediately
+    _trader.log_positions()
+
+    # Main loop
+    scan_interval = 60  # seconds between full scans
+    position_log_interval = 30
+    last_position_log = 0
+
+    log("BOOT", "Bot started. Press Ctrl+C to stop.")
+    print("-" * 60)
+
+    while not _shutdown.is_set():
+        try:
+            # Refresh pairs periodically (every 10 scans just re-use cached)
+            scan_pairs(pairs, _trader, usd_php)
+
+            # Log positions
+            now = time.time()
+            if now - last_position_log > position_log_interval:
+                _trader.log_positions()
+                last_position_log = now
+
+            # Check for closed positions (LIVE mode)
+            if config.TRADE_MODE == "LIVE":
+                _trader.check_closed_positions()
+
+            # Wait for next scan
+            for _ in range(scan_interval):
+                if _shutdown.is_set():
+                    break
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log_error("MAIN", str(e))
+            time.sleep(10)
+
+    # ─── SHUTDOWN ─────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    log("SHUTDOWN", "Graceful shutdown initiated...")
+
+    _trader.stop()
+
+    if config.TRADE_MODE == "DEMO":
+        summary = _trader.get_position_summary()
+        log("SUMMARY", f"Total trades: {summary['total_trades']}")
+        log("SUMMARY", f"Final balance: ₱{summary['balance_php']:,.0f}")
+        log("SUMMARY", f"Total PnL: ₱{summary['pnl_php']:+,.0f}")
+        if summary["history"]:
+            print("\nLast trades:")
+            for t in summary["history"]:
+                print(f"  {t['symbol']} {t['side']} ROI:{t['roi']:+.1f}% "
+                      f"PnL:₱{t['pnl_php']:+,.0f} [{t['reason']}]")
+    else:
+        active, closed = _trader.get_position_summary()
+        log("SUMMARY", f"Active: {len(active)} | Closed: {len(closed)}")
+        total_pnl = sum(p.close_pnl for p in closed)
+        log("SUMMARY", f"Realized PnL: ₱{total_pnl:+,.0f}")
+
+    print("=" * 60)
+    close_logger()
+
+
+if __name__ == "__main__":
+    main()
